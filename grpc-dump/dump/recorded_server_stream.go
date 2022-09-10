@@ -1,6 +1,8 @@
 package dump
 
 import (
+	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -21,6 +23,12 @@ type recordedServerStream struct {
 
 func (ss *recordedServerStream) SendHeader(headers metadata.MD) error {
 	ss.Lock()
+
+	if val, ok := headers["realauthority"]; ok {
+		fmt.Fprintln(os.Stderr, "Real Authority shouldn't be here!", val)
+		os.Exit(1)
+	}
+
 	ss.headers = metadata.Join(ss.headers, headers)
 	ss.Unlock()
 	return ss.ServerStream.SendHeader(headers)
@@ -28,6 +36,12 @@ func (ss *recordedServerStream) SendHeader(headers metadata.MD) error {
 
 func (ss *recordedServerStream) SetHeader(headers metadata.MD) error {
 	ss.Lock()
+
+	if val, ok := headers["realauthority"]; ok {
+		fmt.Fprintln(os.Stderr, "Real Authority shouldn't be here!", val)
+		os.Exit(1)
+	}
+
 	ss.headers = metadata.Join(ss.headers, headers)
 	ss.Unlock()
 	return ss.ServerStream.SetHeader(headers)

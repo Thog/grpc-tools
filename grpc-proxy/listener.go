@@ -21,6 +21,7 @@ func (p proxiedConn) OriginalDestination() string {
 type proxyListener struct {
 	logger  logrus.FieldLogger
 	channel chan net.Conn
+	proxied []proxiedConn
 	errs    chan error
 	net.Listener
 	once sync.Once
@@ -30,6 +31,7 @@ func newProxyListener(logger logrus.FieldLogger, listener net.Listener) *proxyLi
 	return &proxyListener{
 		logger:   logger,
 		channel:  make(chan net.Conn),
+		proxied:  make([]proxiedConn, 0),
 		errs:     make(chan error),
 		Listener: listener,
 		once:     sync.Once{},
@@ -37,7 +39,24 @@ func newProxyListener(logger logrus.FieldLogger, listener net.Listener) *proxyLi
 }
 
 func (l *proxyListener) internalRedirect(conn net.Conn, originalDestination string) {
-	l.channel <- proxiedConn{conn, originalDestination}
+	elem := proxiedConn{conn, originalDestination}
+	l.proxied = append(l.proxied, elem)
+	l.logger.Debug("internalRedirect:", conn.RemoteAddr(), originalDestination)
+
+	l.channel <- elem
+}
+
+func (l *proxyListener) getProxiedOriginalDestination(conn net.Conn) string {
+	for index := range l.proxied {
+		element := l.proxied[index]
+
+		if element.Conn.RemoteAddr() == conn.RemoteAddr() {
+			l.logger.Debug("getProxiedOriginalDestination:", conn.RemoteAddr(), element.OriginalDestination())
+			return element.OriginalDestination()
+		}
+	}
+
+	return ""
 }
 
 func (l *proxyListener) Accept() (net.Conn, error) {

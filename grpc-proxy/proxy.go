@@ -2,10 +2,12 @@ package grpc_proxy
 
 import (
 	"context"
-	"crypto/tls"
+	"crypto"
 	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -13,7 +15,6 @@ import (
 
 	"github.com/bradleyjkemp/grpc-tools/internal"
 	"github.com/bradleyjkemp/grpc-tools/internal/codec"
-	"github.com/bradleyjkemp/grpc-tools/internal/detectcert"
 	"github.com/bradleyjkemp/grpc-tools/internal/proxy_settings"
 	"github.com/bradleyjkemp/grpc-tools/internal/proxydialer"
 	"github.com/bradleyjkemp/grpc-tools/internal/tlsmux"
@@ -34,10 +35,11 @@ type server struct {
 
 	networkInterface string
 	port             int
+	targetDomains    string
 	certFile         string
 	keyFile          string
-	x509Cert         *x509.Certificate
-	tlsCert          tls.Certificate
+	caCert           *x509.Certificate
+	caKey            crypto.PrivateKey
 
 	destination string
 	connPool    *internal.ConnPool
@@ -80,22 +82,35 @@ func New(configurators ...Configurator) (*server, error) {
 		logger.SetLevel(level)
 	}
 
-	if s.certFile == "" && s.keyFile == "" {
-		var err error
-		s.certFile, s.keyFile, err = detectcert.Detect()
-		if err != nil {
-			s.logger.WithError(err).Info("Failed to detect certificates")
-		}
-	}
-
 	if s.certFile != "" && s.keyFile != "" {
 		var err error
-		s.tlsCert, err = tls.LoadX509KeyPair(s.certFile, s.keyFile)
+
+		certPEMBlock, err := ioutil.ReadFile(s.certFile)
 		if err != nil {
 			return nil, err
 		}
 
-		s.x509Cert, err = x509.ParseCertificate(s.tlsCert.Certificate[0]) //TODO do we need to parse anything other than [0]?
+		certDERBlock, _ := pem.Decode(certPEMBlock)
+		if certDERBlock == nil || certDERBlock.Type != "CERTIFICATE" {
+			log.Fatalln("ERROR: failed to read the CA certificate: unexpected content")
+		}
+
+		s.caCert, err = x509.ParseCertificate(certDERBlock.Bytes)
+		if err != nil {
+			return nil, err
+		}
+
+		keyPEMBlock, err := ioutil.ReadFile(s.keyFile)
+		if err != nil {
+			return nil, err
+		}
+
+		keyDERBlock, _ := pem.Decode(keyPEMBlock)
+		if keyDERBlock == nil || keyDERBlock.Type != "PRIVATE KEY" {
+			log.Fatalln("ERROR: failed to read the CA key: unexpected content")
+		}
+
+		s.caKey, err = x509.ParsePKCS8PrivateKey(keyDERBlock.Bytes)
 		if err != nil {
 			return nil, err
 		}
@@ -111,8 +126,8 @@ func (s *server) Start() error {
 		return fmt.Errorf("failed to listen on interface (%s:%d): %v", s.networkInterface, s.port, err)
 	}
 	s.logger.Infof("Listening on %s", s.listener.Addr())
-	if s.x509Cert != nil {
-		s.logger.Infof("Intercepting TLS connections to domains: %s", s.x509Cert.DNSNames)
+	if s.caCert != nil {
+		s.logger.Infof("Intercepting TLS connections to domains: %s", s.targetDomains)
 	} else {
 		s.logger.Infof("Not intercepting TLS connections")
 	}
@@ -125,8 +140,8 @@ func (s *server) Start() error {
 
 	proxyLis := newProxyListener(s.logger, s.listener)
 	httpReverseProxy := newReverseProxy(s.logger)
-	httpServer := newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect, httpReverseProxy)
-	httpsServer := withHttpsMiddleware(newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect, httpReverseProxy))
+	httpServer := newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect, proxyLis.getProxiedOriginalDestination, httpReverseProxy)
+	httpsServer := withHttpsMiddleware(newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect, proxyLis.getProxiedOriginalDestination, httpReverseProxy))
 
 	// Use file path for Master Secrets file is specified. Send to /dev/null if not.
 	keyLogWriter := ioutil.Discard
@@ -136,7 +151,7 @@ func (s *server) Start() error {
 			return fmt.Errorf("failed opening secrets file on path: %s", s.tlsSecretsFile)
 		}
 	}
-	httpLis, httpsLis := tlsmux.New(s.logger, proxyLis, s.x509Cert, s.tlsCert, keyLogWriter)
+	httpLis, httpsLis := tlsmux.New(s.logger, proxyLis, s.caCert, s.caKey, s.targetDomains, keyLogWriter)
 
 	errChan := make(chan error)
 	if s.enableSystemProxy {

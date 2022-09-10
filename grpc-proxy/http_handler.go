@@ -1,6 +1,7 @@
 package grpc_proxy
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,15 +20,32 @@ type grpcWebServer interface {
 	IsGrpcWebRequest(req *http.Request) bool
 }
 
-func newHttpServer(logger logrus.FieldLogger, grpcHandler grpcWebServer, internalRedirect func(net.Conn, string), reverseProxy http.Handler) *http.Server {
+type contextKey struct {
+	key string
+}
+
+var ConnContextKey = &contextKey{"http-conn"}
+
+func SaveConnInContext(ctx context.Context, c net.Conn) context.Context {
+	return context.WithValue(ctx, ConnContextKey, c)
+}
+func GetConn(r *http.Request) net.Conn {
+	return r.Context().Value(ConnContextKey).(net.Conn)
+}
+
+func newHttpServer(logger logrus.FieldLogger, grpcHandler grpcWebServer, internalRedirect func(net.Conn, string), getProxiedOriginalDestination func(net.Conn) string, reverseProxy http.Handler) *http.Server {
 	return &http.Server{
 		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.Method == http.MethodConnect:
 				logger.Debug("Handling HTTP CONNECT request for destination ", r.URL)
-				handleConnect(w, r, internalRedirect)
+				handleConnect(logger, w, r, internalRedirect)
 			case isGrpcRequest(grpcHandler, r):
+				conn := GetConn(r)
+				originalDestination := getProxiedOriginalDestination(conn)
+
 				logger.Debug("Handling gRPC request ", r.URL)
+
 				// This request may be a gRPC-Web request that came in on HTTP/1.X
 				// So delete any legacy headers that will cause gRPC to break
 				// I don't really know why this works but without these lines the integration tests fail
@@ -35,6 +53,7 @@ func newHttpServer(logger logrus.FieldLogger, grpcHandler grpcWebServer, interna
 				// Bad Request: HTTP status code 400; transport: received the unexpected content-type \"text/plain; charset=utf-8\"
 				r.Header.Del("Connection")
 				r.Header.Del("Proxy-Connection")
+				r.Header.Add("realauthority", originalDestination)
 				grpcHandler.ServeHTTP(w, r)
 			default:
 				// Many clients use a mix of gRPC and non-gRPC requests
@@ -44,10 +63,11 @@ func newHttpServer(logger logrus.FieldLogger, grpcHandler grpcWebServer, interna
 				reverseProxy.ServeHTTP(w, r)
 			}
 		}), &http2.Server{}),
+		ConnContext: SaveConnInContext,
 	}
 }
 
-func handleConnect(w http.ResponseWriter, r *http.Request, internalRedirect func(net.Conn, string)) {
+func handleConnect(logger logrus.FieldLogger, w http.ResponseWriter, r *http.Request, internalRedirect func(net.Conn, string)) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)

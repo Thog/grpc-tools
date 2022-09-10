@@ -1,13 +1,21 @@
 package tlsmux
 
 import (
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
+	"log"
+	"math/big"
 	"net"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bradleyjkemp/grpc-tools/internal/peekconn"
 	"github.com/sirupsen/logrus"
@@ -46,7 +54,7 @@ func (c *tlsMuxListener) Close() error {
 	return err
 }
 
-func New(logger logrus.FieldLogger, listener net.Listener, cert *x509.Certificate, tlsCert tls.Certificate, keyLogWriter io.Writer) (net.Listener, net.Listener) {
+func New(logger logrus.FieldLogger, listener net.Listener, caCert *x509.Certificate, caKey crypto.PrivateKey, targetDomains string, keyLogWriter io.Writer) (net.Listener, net.Listener) {
 	var nonTLSConns = make(chan net.Conn, 128) // TODO decide on good buffer sizes for these channels
 	var nonTLSErrs = make(chan error, 128)
 	var tlsConns = make(chan net.Conn, 128)
@@ -69,7 +77,15 @@ func New(logger logrus.FieldLogger, listener net.Listener, cert *x509.Certificat
 					tlsErrs <- err
 				}
 				if isTLS {
-					handleTLSConn(logger, conn, cert, tlsConns)
+					var targetDomainsRegex *regexp.Regexp
+
+					if targetDomains == "" {
+						targetDomainsRegex = nil
+					} else {
+						targetDomainsRegex = regexp.MustCompile(targetDomains)
+					}
+
+					handleTLSConn(logger, conn, targetDomainsRegex, tlsConns)
 				} else {
 					nonTLSConns <- conn
 				}
@@ -89,9 +105,12 @@ func New(logger logrus.FieldLogger, listener net.Listener, cert *x509.Certificat
 	}
 
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
 		KeyLogWriter: keyLogWriter,
 	}
+	tlsConfig.GetCertificate = func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return createCertificate(caCert, caKey, chi.ServerName), nil
+	}
+
 	// Support HTTP/2: https://golang.org/pkg/net/http/?m=all#Serve
 	tlsConfig.NextProtos = append(tlsConfig.NextProtos, http2NextProtoTLS)
 	tlsListener := nonHTTPBouncer{
@@ -106,7 +125,64 @@ func New(logger logrus.FieldLogger, listener net.Listener, cert *x509.Certificat
 	return nonTLSListener, tlsListener
 }
 
-func handleTLSConn(logger logrus.FieldLogger, conn net.Conn, cert *x509.Certificate, tlsConns chan net.Conn) {
+func fatalIfErr(err error, msg string) {
+	if err != nil {
+		log.Fatalf("ERROR: %s: %s", msg, err)
+	}
+}
+
+func generateKey() (crypto.PrivateKey, error) {
+	return rsa.GenerateKey(rand.Reader, 2048)
+}
+
+func randomSerialNumber() *big.Int {
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	fatalIfErr(err, "failed to generate serial number")
+	return serialNumber
+}
+
+func createCertificate(caCert *x509.Certificate, caKey crypto.PrivateKey, domain string) *tls.Certificate {
+	if caKey == nil {
+		log.Fatalln("ERROR: can't create new certificates because the CA key is missing")
+	}
+
+	priv, err := generateKey()
+	fatalIfErr(err, "ERROR: can't generate private key for new certificate")
+
+	pub := priv.(crypto.Signer).Public()
+	expiration := time.Now().AddDate(2, 3, 0)
+	tpl := &x509.Certificate{
+		SerialNumber: randomSerialNumber(),
+		Subject: pkix.Name{
+			Organization:       []string{"System Unit Ltd"},
+			OrganizationalUnit: []string{"System Unit"},
+		},
+
+		NotBefore: time.Now(), NotAfter: expiration,
+
+		KeyUsage: x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+	}
+
+	tpl.DNSNames = append(tpl.DNSNames, domain)
+	tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageServerAuth)
+
+	rawCert, err := x509.CreateCertificate(rand.Reader, tpl, caCert, pub, caKey)
+	fatalIfErr(err, "failed to generate certificate")
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rawCert})
+	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
+
+	fatalIfErr(err, "failed to encode certificate key")
+	privPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
+
+	cert, err := tls.X509KeyPair(certPEM, privPEM)
+	fatalIfErr(err, "ERROR: cannot generate key pair!")
+
+	return &cert
+}
+
+func handleTLSConn(logger logrus.FieldLogger, conn net.Conn, targetDomains *regexp.Regexp, tlsConns chan net.Conn) {
 	logger.Debugf("Handling TLS connection %v", conn)
 
 	proxConn, ok := conn.(proxiedConnection)
@@ -126,7 +202,8 @@ func handleTLSConn(logger logrus.FieldLogger, conn net.Conn, cert *x509.Certific
 
 	// trim the port suffix
 	originalHostname := strings.Split(proxConn.OriginalDestination(), ":")[0]
-	if cert != nil && cert.VerifyHostname(originalHostname) == nil {
+	// Accept target domain regex or any ip that perform TLS
+	if targetDomains != nil && (targetDomains.MatchString(originalHostname) || net.ParseIP(originalHostname) != nil) {
 		// the certificate we have allows us to intercept this connection
 		tlsConns <- conn
 		return

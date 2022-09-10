@@ -4,7 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/bradleyjkemp/grpc-tools/grpc-proxy"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	grpc_proxy "github.com/bradleyjkemp/grpc-tools/grpc-proxy"
 	"github.com/bradleyjkemp/grpc-tools/internal"
 	"github.com/bradleyjkemp/grpc-tools/internal/codec"
 	"github.com/bradleyjkemp/grpc-tools/internal/marker"
@@ -13,10 +18,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
-	"io"
-	"os"
-	"strings"
-	"time"
 )
 
 func Run(protoRoots, protoDescriptors, dumpPath, destinationOverride string, dialer grpc_proxy.ContextDialer) error {

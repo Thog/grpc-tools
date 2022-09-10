@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 
@@ -24,6 +25,17 @@ var proxyStreamDesc = &grpc.StreamDesc{
 // Originally based on github.com/mwitkow/grpc-proxy/proxy/handler.go
 func (s *server) proxyHandler(srv interface{}, ss grpc.ServerStream) error {
 	md, ok := metadata.FromIncomingContext(ss.Context())
+
+	fmt.Fprintln(os.Stderr, "Metadata", md)
+
+	var real_authority = md["realauthority"][0]
+
+	if real_authority != "" {
+		fmt.Fprintln(os.Stderr, "Real Authority! ", real_authority)
+	}
+
+	delete(md, "realauthority")
+
 	if !ok {
 		return status.Error(codes.Unknown, "could not extract metadata from request")
 	}
@@ -38,7 +50,20 @@ func (s *server) proxyHandler(srv interface{}, ss grpc.ServerStream) error {
 		options = append(options, grpc.WithInsecure())
 	}
 
-	destinationAddr, err := s.calculateDestination(md)
+	var overrideDestination string = ""
+
+	if real_authority != "" {
+		realAuthoritySplit := strings.Split(real_authority, ":")
+		if net.ParseIP(realAuthoritySplit[0]) != nil {
+			overrideDestination = real_authority
+		}
+	}
+
+	if overrideDestination != "" {
+		fmt.Fprintln(os.Stderr, "overrideDestination ", overrideDestination)
+	}
+
+	destinationAddr, err := s.calculateDestination(md, overrideDestination)
 	if err != nil {
 		return err
 	}
@@ -95,10 +120,13 @@ func (s *server) proxyHandler(srv interface{}, ss grpc.ServerStream) error {
 	return status.Errorf(codes.Internal, "gRPC proxying should never reach this stage.")
 }
 
-func (s *server) calculateDestination(md metadata.MD) (string, error) {
+func (s *server) calculateDestination(md metadata.MD, overrideDestination string) (string, error) {
 	authority := md.Get(":authority")
 	var destinationAddr string
 	switch {
+	case overrideDestination != "":
+		destinationAddr = overrideDestination
+
 	case s.destination != "":
 		// used hardcoded destination if set (used by clients not supporting HTTP proxies)
 		destinationAddr = s.destination
